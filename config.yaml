@@ -2,7 +2,7 @@ project_name: "decoder-only-shakespeare"
 seed: 42
 
 comet:
-  api_key: ""  # вставь сюда свой API key с comet.com (профиль -> иконка ключа)
+  api_key: "sqAgtJu3JqBTsHLGMTekvp9GH"
 
 data:
   train_text: "TinyShakespeare/train.csv"
