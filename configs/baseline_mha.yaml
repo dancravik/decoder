@@ -1,5 +1,5 @@
-# Корневой конфиг = baseline (классический MHA + manual attention + dense FFN).
-# Эксперименты для сравнения лежат в configs/, запуск: python run_experiments.py
+# Базовый конфиг: классический decoder-only GPT (MHA + manual attention + dense FFN)
+# API key для Comet ML берётся из env COMET_API_KEY (не храним в git!)
 project_name: "decoder-only-shakespeare"
 experiment_name: "baseline_mha"
 seed: 42

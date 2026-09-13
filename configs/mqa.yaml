@@ -1,0 +1,6 @@
+base: baseline_mha
+
+# Multi-Query Attention: 6 query голов, 1 общая KV голова (KV-кэш в 6 раз меньше)
+experiment_name: "mqa"
+structural:
+  attention: "mqa"

@@ -1,0 +1,18 @@
+base: baseline_mha
+
+# Всё вместе: GQA + FlashAttention + MoE (aux-free)
+experiment_name: "modern_all"
+structural:
+  attention: "gqa"
+  n_kv_heads: 2
+  use_sdpa: true
+  ffn: "moe"
+  moe:
+    d_ff_shared: 768
+    d_ff: 384
+    n_shared: 1
+    n_routed: 8
+    top_k: 2
+    balance: "aux_free"
+    balance_alpha: 0.0001
+    bias_gamma: 0.001

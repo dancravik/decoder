@@ -1,0 +1,7 @@
+base: baseline_mha
+
+# Grouped-Query Attention: 6 query голов, 2 KV головы (KV-кэш в 3 раза меньше)
+experiment_name: "gqa"
+structural:
+  attention: "gqa"
+  n_kv_heads: 2

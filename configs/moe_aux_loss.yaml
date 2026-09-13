@@ -1,0 +1,15 @@
+base: baseline_mha
+
+# MoE с классическим auxiliary loss (Switch Transformer style)
+experiment_name: "moe_aux_loss"
+structural:
+  attention: "mha"
+  ffn: "moe"
+  moe:
+    d_ff_shared: 768
+    d_ff: 384
+    n_shared: 1
+    n_routed: 8
+    top_k: 2
+    balance: "aux_loss"
+    balance_alpha: 0.01

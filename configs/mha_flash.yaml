@@ -1,0 +1,7 @@
+base: baseline_mha
+
+# MHA + FlashAttention (SDPA kernel): та же архитектура, другой attention kernel
+experiment_name: "mha_flash"
+structural:
+  attention: "mha"
+  use_sdpa: true

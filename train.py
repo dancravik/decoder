@@ -2,6 +2,8 @@ import json
 import math
 import os
 import random
+import subprocess
+import time
 
 import numpy as np
 import torch
@@ -13,6 +15,7 @@ from decoder import (
     CharTokenizer,
     ShakespeareDataset,
     build_decoder_only,
+    count_params,
     read_csv_text,
 )
 
@@ -67,11 +70,20 @@ COMMON_WORDS = {
 }
 
 try:
-    from comet_ml import Experiment, API
+    from comet_ml import Experiment
 
     COMET_AVAILABLE = True
 except ImportError:
     COMET_AVAILABLE = False
+
+try:
+    import pynvml
+
+    pynvml.nvmlInit()
+    NVML_HANDLE = pynvml.nvmlDeviceGetHandleByIndex(0)
+    NVML_AVAILABLE = True
+except Exception:
+    NVML_AVAILABLE = False
 
 
 def set_seed(seed):
@@ -82,9 +94,25 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def deep_merge(base, override):
+    out = dict(base)
+    for k, v in override.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def load_config(path="config.yaml"):
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    if cfg.pop("base", None):
+        base_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "baseline_mha.yaml")
+        with open(base_path, "r", encoding="utf-8") as f:
+            base = yaml.safe_load(f)
+        cfg = deep_merge(base, cfg)
+    return cfg
 
 
 def get_lr(step, base_lr, warmup_steps, max_steps):
@@ -105,8 +133,23 @@ def word_fraction(tokenizer, generated_ids):
     return hits / len(words)
 
 
+def gpu_util():
+    if NVML_AVAILABLE:
+        try:
+            return float(pynvml.nvmlDeviceGetUtilizationRates(NVML_HANDLE).gpu)
+        except Exception:
+            return None
+    return None
+
+
+def gpu_mem_mb():
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / 1024**2
+    return None
+
+
 @torch.no_grad()
-def estimate_loss(model, dataset, device, batch_size, ctx, num_batches, use_amp, amp_dtype):
+def estimate_loss(model, dataset, device, batch_size, num_batches, use_amp, amp_dtype):
     model.eval()
     n = len(dataset)
     if n == 0:
@@ -117,23 +160,60 @@ def estimate_loss(model, dataset, device, batch_size, ctx, num_batches, use_amp,
         x = torch.stack([dataset[int(i)][0] for i in idxs]).to(device)
         y = torch.stack([dataset[int(i)][1] for i in idxs]).to(device)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            log_probs = model(x, None)
+            log_probs, _ = model(x, None)
             losses.append(F.nll_loss(log_probs.view(-1, log_probs.size(-1)), y.view(-1)).item())
     model.train()
     return float(np.mean(losses))
 
 
+@torch.no_grad()
+def bench_generation(model, device, n_tokens=128, use_cache=True):
+    """tokens/sec инкрементальной генерации (с KV-кэшем или без)."""
+    model.eval()
+    idx = torch.zeros(1, 8, dtype=torch.long, device=device)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        start_mem = torch.cuda.memory_allocated()
+    t0 = time.perf_counter()
+    model.generate(idx, max_new_tokens=n_tokens, use_cache=use_cache)
+    dt = time.perf_counter() - t0
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        kv_bytes = torch.cuda.memory_allocated() - start_mem
+    else:
+        kv_bytes = None
+    model.train()
+    return n_tokens / dt, kv_bytes
+
+
+def cuda_works():
+    if not torch.cuda.is_available():
+        return False
+    archs = torch.cuda.get_arch_list()
+    major, minor = torch.cuda.get_device_capability(0)
+    name = torch.cuda.get_device_name(0)
+    sm = f"sm_{major}{minor}"
+    if sm not in archs:
+        print("=" * 70)
+        print(f"ERROR: GPU '{name}' has CUDA capability {sm},")
+        print(f"but this PyTorch build only supports: {archs}")
+        print("On Kaggle: Settings -> Accelerator -> GPU T4 x2, then re-run.")
+        print("Falling back to CPU (slow).")
+        print("=" * 70)
+        return False
+    try:
+        (torch.zeros(1, device="cuda") + 1).item()
+        return True
+    except Exception as e:
+        print(f"CUDA runtime check failed: {e}. Falling back to CPU (slow).")
+        return False
+
+
 def main():
-    config = load_config(os.environ.get("CONFIG", "config.yaml"))
+    config_path = os.environ.get("CONFIG", "config.yaml")
+    config = load_config(config_path)
     seed = config.get("seed", 42)
     set_seed(seed)
-
-    train_text = read_csv_text(config["data"]["train_text"])
-    val_text = read_csv_text(config["data"]["val_text"])
-
-    tokenizer = CharTokenizer()
-    tokenizer.train(train_text + val_text)
-    vocab_size = tokenizer.vocab_size
 
     s = {k: (float(v) if k in ("dropout", "weight_decay") else v) for k, v in config["structural"].items()}
     t = {k: (float(v) if k == "lr" else v) for k, v in config["training"].items()}
@@ -147,7 +227,17 @@ def main():
     sample_interval = int(t.get("sample_interval", 500))
     ckpt_interval = int(t.get("ckpt_interval", 1000))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    experiment_name = config.get("experiment_name") or os.path.splitext(os.path.basename(config_path))[0]
+
+    train_text = read_csv_text(config["data"]["train_text"])
+    val_text = read_csv_text(config["data"]["val_text"])
+
+    tokenizer = CharTokenizer()
+    tokenizer.train(train_text + val_text)
+    vocab_size = tokenizer.vocab_size
+
+    device = torch.device("cuda" if cuda_works() else "cpu")
+    print(f"experiment={experiment_name}")
     print(f"device={device} vocab_size={vocab_size}")
 
     train_dataset = ShakespeareDataset(tokenizer.encode(train_text), seq_len)
@@ -156,8 +246,12 @@ def main():
 
     model = build_decoder_only(config, vocab_size).to(device)
     raw_model = model
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"params={n_params/1e6:.2f}M")
+    n_total, n_active = count_params(model)
+    print(
+        f"params: total={n_total/1e6:.2f}M active={n_active/1e6:.2f}M "
+        f"attention={s.get('attention', 'mha')} sdpa={bool(s.get('use_sdpa', False))} "
+        f"ffn={s.get('ffn', 'dense')}"
+    )
 
     use_amp = device.type == "cuda"
     if use_amp and not torch.cuda.is_bf16_supported():
@@ -183,13 +277,18 @@ def main():
     if COMET_AVAILABLE and api_key:
         experiment = Experiment(
             api_key=api_key,
-            project_name=config["project_name"],
+            project_name=config.get("project_name", "decoder-only-shakespeare"),
         )
-        experiment.log_parameters({**s, **t, "vocab_size": vocab_size, "n_params": n_params})
+        experiment.set_name(experiment_name)
+        experiment.log_parameters(
+            {**s, **{k: v for k, v in t.items() if isinstance(v, (int, float, str))},
+             "vocab_size": vocab_size, "n_params_total": n_total, "n_params_active": n_active,
+             "experiment_name": experiment_name}
+        )
 
-    results_dir = "results"
+    results_dir = os.environ.get("RESULTS_DIR", "results")
     os.makedirs(results_dir, exist_ok=True)
-    jsonl_path = os.path.join(results_dir, "metrics.jsonl")
+    jsonl_path = os.path.join(results_dir, f"metrics_{experiment_name}.jsonl")
 
     def log_metrics(metrics, step):
         print(
@@ -198,12 +297,17 @@ def main():
         with open(jsonl_path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"step": step, **metrics}) + "\n")
         if experiment:
-            experiment.log_metrics(metrics, step=step)
+            clean = {k: v for k, v in metrics.items() if v is not None}
+            experiment.log_metrics(clean, step=step)
+
+    log_metrics({"n_params_total": n_total, "n_params_active": n_active}, 0)
 
     model.train()
     step = 0
     best_val = float("inf")
     data_iter = iter(train_loader)
+    tokens_per_step = batch_size * seq_len
+    t_start = time.perf_counter()
 
     while step < max_steps:
         for param_group in optimizer.param_groups:
@@ -218,39 +322,61 @@ def main():
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            log_probs = model(x, None)
+            log_probs, _ = model(x, None)
             loss = F.nll_loss(
                 log_probs.view(-1, log_probs.size(-1)), y.view(-1)
             )
-        scaler.scale(loss).backward()
+            moe_loss = raw_model.get_moe_loss()
+            total_loss = loss + moe_loss if moe_loss is not None else loss
+        scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
 
+        raw_model.update_moe_bias()
+
         if step % 10 == 0:
-            log_metrics({"train_loss": loss.item(), "lr": get_lr(step, base_lr, warmup_steps, max_steps)}, step)
+            elapsed = time.perf_counter() - t_start
+            metrics = {
+                "train_loss": loss.item(),
+                "lr": get_lr(step, base_lr, warmup_steps, max_steps),
+                "tokens_per_sec": tokens_per_step * (step + 1) / max(elapsed, 1e-9),
+                "steps_per_sec": (step + 1) / max(elapsed, 1e-9),
+            }
+            if moe_loss is not None:
+                metrics["moe_balance_loss"] = float(moe_loss)
+                ls = raw_model.moe_load_std()
+                if ls is not None:
+                    metrics["moe_load_std"] = ls
+            util = gpu_util()
+            if util is not None:
+                metrics["gpu_util"] = util
+            mem = gpu_mem_mb()
+            if mem is not None:
+                metrics["gpu_mem_mb"] = mem
+            log_metrics(metrics, step)
 
         if step % eval_interval == 0 or step == max_steps - 1:
-            val_loss = estimate_loss(model, val_dataset, device, batch_size, seq_len, 30, use_amp, amp_dtype)
+            val_loss = estimate_loss(model, val_dataset, device, batch_size, 30, use_amp, amp_dtype)
             log_metrics({"val_loss": val_loss, "val_perplexity": math.exp(min(val_loss, 20))}, step)
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save(
                     {"model": raw_model.state_dict(), "step": step, "config": config, "vocab": tokenizer.vocab},
-                    os.path.join(results_dir, "ckpt_best.pt"),
+                    os.path.join(results_dir, f"ckpt_{experiment_name}_best.pt"),
                 )
 
         if step % sample_interval == 0 or step == max_steps - 1:
             raw_model.eval()
             ctx = x[:1, :64]
             with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                gen = raw_model.generate(ctx, max_new_tokens=t.get("sample_length", 256))
+                gen = raw_model.generate(ctx, max_new_tokens=int(t.get("sample_length", 256)))
             raw_model.train()
             text = tokenizer.decode(gen[0].cpu().tolist())
             wf = word_fraction(tokenizer, gen[0].cpu().tolist())
             log_metrics({"word_fraction": wf}, step)
-            sample_path = os.path.join(results_dir, f"sample_{step:06d}.txt")
+            sample_path = os.path.join(results_dir, f"sample_{experiment_name}_{step:06d}.txt")
             with open(sample_path, "w", encoding="utf-8") as f:
                 f.write(text)
             if experiment:
@@ -266,9 +392,19 @@ def main():
                 "config": config,
                 "vocab": tokenizer.vocab,
             }
-            torch.save(ckpt, os.path.join(results_dir, f"ckpt_{step:06d}.pt"))
+            torch.save(ckpt, os.path.join(results_dir, f"ckpt_{experiment_name}_{step:06d}.pt"))
 
         step += 1
+
+    # Финальный бенчмарк генерации: с KV-кэшем и без
+    raw_model.eval()
+    for use_cache, tag in ((True, "cached"), (False, "uncached")):
+        tps, kv_bytes = bench_generation(raw_model, device, n_tokens=128, use_cache=use_cache)
+        m = {f"gen_tokens_per_sec_{tag}": tps}
+        if kv_bytes:
+            m["gen_kv_cache_mb"] = kv_bytes / 1024**2
+        log_metrics(m, step)
+    raw_model.train()
 
     if experiment:
         experiment.end()

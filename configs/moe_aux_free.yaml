@@ -1,0 +1,18 @@
+base: baseline_mha
+
+# MoE: DeepSeek-style (1 shared + 8 routed, top-2), aux-loss-free балансировка
+# (bias-коррекция + sequence-wise balance loss, DeepSeek-V3).
+# Активные параметры на токен ~ как у baseline (см. decoder.py count_params).
+experiment_name: "moe_aux_free"
+structural:
+  attention: "mha"
+  ffn: "moe"
+  moe:
+    d_ff_shared: 768
+    d_ff: 384          # размер routed-эксперта
+    n_shared: 1
+    n_routed: 8
+    top_k: 2
+    balance: "aux_free"
+    balance_alpha: 0.0001
+    bias_gamma: 0.001

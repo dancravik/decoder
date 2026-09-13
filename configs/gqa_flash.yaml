@@ -1,0 +1,8 @@
+base: baseline_mha
+
+# GQA + FlashAttention
+experiment_name: "gqa_flash"
+structural:
+  attention: "gqa"
+  n_kv_heads: 2
+  use_sdpa: true
